@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "langchain-compensation"
-version = "0.1.0"
-description = "Automatic compensation middleware for LangChain agents with LIFO rollback"
+version = "0.2.2"
+description = "Automatic compensation middleware for LangChain agents with dependency-aware rollback"
 readme = "README.md"
 requires-python = ">=3.9"
 license = {text = "MIT"}

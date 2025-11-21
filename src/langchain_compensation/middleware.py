@@ -23,6 +23,7 @@ class CompensationRecord(dict):
         result: Any = None,
         status: str = "PENDING",
         compensated: bool = False,
+        depends_on: List[str] | None = None,
     ):
         super().__init__(
             id=id,
@@ -33,6 +34,7 @@ class CompensationRecord(dict):
             status=status,
             compensated=compensated,
             compensation_tool=compensation_tool,
+            depends_on=depends_on or [],
         )
 
 
@@ -52,13 +54,51 @@ class CompensationLog:
             self._records[record_id].update(kwargs)
 
     def get_rollback_plan(self) -> List[CompensationRecord]:
-        """Returns uncompensated completed actions in reverse chronological order (LIFO)."""
+        """Returns uncompensated completed actions in reverse dependency order.
+        
+        Uses topological sort to ensure dependencies are compensated before their dependents.
+        For actions with no dependencies, falls back to reverse timestamp order (LIFO).
+        """
+        # Get all uncompensated completed actions
         candidates = [
             r
             for r in self._records.values()
             if r["status"] == "COMPLETED" and not r["compensated"] and r["compensation_tool"]
         ]
-        return sorted(candidates, key=lambda x: x["timestamp"], reverse=True)
+        
+        if not candidates:
+            return []
+        
+        # Build dependency graph
+        id_to_record = {r["id"]: r for r in candidates}
+        
+        # Calculate reverse topological order (compensate dependents before dependencies)
+        visited = set()
+        result = []
+        
+        def visit(record_id: str) -> None:
+            if record_id in visited or record_id not in id_to_record:
+                return
+            
+            visited.add(record_id)
+            record = id_to_record[record_id]
+            
+            # Visit all records that depend on this one (they must be compensated first)
+            for other_id, other_record in id_to_record.items():
+                if record_id in other_record.get("depends_on", []):
+                    visit(other_id)
+            
+            result.append(record)
+        
+        # Visit all nodes, prioritizing by reverse timestamp for tie-breaking
+        for record in sorted(candidates, key=lambda x: x["timestamp"], reverse=True):
+            visit(record["id"])
+        
+        print(f"DEBUG get_rollback_plan: Returning {len(result)} actions in order:")
+        for r in result:
+            print(f"  - {r['tool_name']}")
+        
+        return result
 
     def mark_compensated(self, record_id: str) -> None:
         """Mark an action as compensated."""
@@ -182,6 +222,13 @@ class CompensationMiddleware(AgentMiddleware):
                 if id_field in result:
                     return {id_field: result[id_field]}
             return result
+        
+        # For string results, treat them as the primary ID parameter
+        # Common patterns: "flight_id_123", "booking_xyz", etc.
+        if isinstance(result, str):
+            # Try common parameter names for compensation tools
+            for id_param in ["booking_id", "id", "resource_id", "transaction_id"]:
+                return {id_param: result}
 
         return result  # Return raw result for other types
 
@@ -218,21 +265,30 @@ class CompensationMiddleware(AgentMiddleware):
         # Cache this tool for potential compensation use
         self._cache_tool_from_request(request)
 
-        # Load compensation log from state
-        comp_log = CompensationLog.from_dict(state.get("compensation_log", {}))
-
         is_compensatable = tool_name in self.compensation_mapping
         action_id = str(uuid.uuid4())
 
         # Track compensatable action before execution
         if is_compensatable:
             with self._lock:
+                # Always reload from state to get latest records (avoid lost updates)
+                comp_log = CompensationLog.from_dict(state.get("compensation_log", {}))
+                
+                # Determine dependencies: this action depends on all previous completed actions
+                # This ensures proper rollback order for sequential operations
+                depends_on = [
+                    r["id"]
+                    for r in comp_log._records.values()
+                    if r["status"] == "COMPLETED" and not r["compensated"]
+                ]
+                
                 record = CompensationRecord(
                     id=action_id,
                     tool_name=tool_name,
                     params=request.tool_call.get("args", {}),
                     timestamp=time.time(),
                     compensation_tool=self.compensation_mapping[tool_name],
+                    depends_on=depends_on,
                 )
                 comp_log.add(record)
                 state["compensation_log"] = comp_log.to_dict()
@@ -246,6 +302,9 @@ class CompensationMiddleware(AgentMiddleware):
         is_error = self._is_error(result)
 
         with self._lock:
+            # Always reload from state before making updates
+            comp_log = CompensationLog.from_dict(state.get("compensation_log", {}))
+            
             if is_error:
                 print(f"Tool '{tool_name}' failed. Rolling back...")
 
@@ -255,9 +314,9 @@ class CompensationMiddleware(AgentMiddleware):
                         action_id, status="FAILED", result=self._extract_result(result)
                     )
 
-                # Execute rollback plan in LIFO order
+                # Execute rollback plan in dependency order
                 plan = comp_log.get_rollback_plan()
-
+                
                 for record in plan:
                     comp_tool = record["compensation_tool"]
                     print(f"Rolling back '{record['tool_name']}' using '{comp_tool}'...")
