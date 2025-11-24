@@ -27,6 +27,7 @@ def create_comp_agent(
     state_mappers: dict[str, Callable[[Any, dict[str, Any]], dict[str, Any]]] | None = None,
     system_prompt: str | None = None,
     middleware: Sequence[AgentMiddleware] = (),
+    comp_log_ref: object | None = None,
     response_format: ResponseFormat | None = None,
     context_schema: type[Any] | None = None,
     checkpointer: Checkpointer | None = None,
@@ -86,6 +87,7 @@ def create_comp_agent(
         compensation_mapping=compensation_mapping,
         tools=tools,
         state_mappers=state_mappers,
+        comp_log_ref=comp_log_ref,
     )
 
     agent_middleware = [comp_middleware]

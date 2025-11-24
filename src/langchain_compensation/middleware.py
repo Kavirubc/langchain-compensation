@@ -1,9 +1,11 @@
 """Compensation middleware for agents with automatic LIFO rollback."""
 
+
 import json
 import threading
 import time
 import uuid
+import logging
 from typing import Any, Callable, Dict, List
 
 from langchain_core.messages import ToolMessage
@@ -92,13 +94,13 @@ class CompensationLog:
                             idx += 1
                         queue.insert(idx, dependent_id)
             if len(result) != len(candidates):
-                print("WARNING: Dependency cycle detected! Falling back to timestamp order.")
+                logging.warning("Dependency cycle detected! Falling back to timestamp order.")
                 result = sorted(candidates, key=lambda x: x["timestamp"], reverse=True)
-            print(f"DEBUG get_rollback_plan: Returning {len(result)} actions in DAG order:")
+            logging.debug(f"get_rollback_plan: Returning {len(result)} actions in DAG order:")
             for r in result:
                 deps = r.get("depends_on", [])
                 dep_info = f" (depends on {len(deps)} actions)" if deps else " (no dependencies)"
-                print(f"  - {r['tool_name']}{dep_info}")
+                logging.debug(f"  - {r['tool_name']}{dep_info}")
             return result
 
     def mark_compensated(self, record_id: str) -> None:
@@ -126,7 +128,7 @@ class CompensationMiddleware(AgentMiddleware):
         compensation_mapping: Dict[str, str],
         tools: Any = None,
         state_mappers: Dict[str, Callable[[Any, Dict[str, Any]], Dict[str, Any]]] | None = None,
-        comp_log_ref: dict | None = None,
+        comp_log_ref: object | None = None,
     ):
         """
         Initialize compensation middleware.
@@ -142,8 +144,19 @@ class CompensationMiddleware(AgentMiddleware):
         self.state_mappers = state_mappers or {}
         self._tools_cache: Dict[str, Any] = {}
         self._lock = threading.Lock()
-        self._comp_log_ref = comp_log_ref
+        self._comp_log_ref = None
         self._shared_comp_log_instance = None
+
+        # If comp_log_ref is provided, set up a live CompensationLog instance
+        if comp_log_ref is not None:
+            if isinstance(comp_log_ref, CompensationLog):
+                self._shared_comp_log_instance = comp_log_ref
+                self._comp_log_ref = comp_log_ref  # for compatibility
+            elif isinstance(comp_log_ref, dict):
+                self._shared_comp_log_instance = CompensationLog(records=comp_log_ref)
+                self._comp_log_ref = comp_log_ref
+            else:
+                raise ValueError("comp_log_ref must be a dict or CompensationLog instance")
 
         # Cache all tools upfront for compensation use
         if tools:
@@ -296,7 +309,7 @@ class CompensationMiddleware(AgentMiddleware):
             # Check for data flow: do any param values match result values?
             if param_values & result_values:  # Set intersection
                 dependencies.append(record["id"])
-                print(f"  Data flow detected: Current action depends on '{record['tool_name']}' (ID: {record['id'][:8]}...)")
+                logging.debug(f"Data flow detected: Current action depends on '{record['tool_name']}' (ID: {record['id'][:8]}...)")
         
         return dependencies
 
@@ -358,28 +371,26 @@ class CompensationMiddleware(AgentMiddleware):
     def wrap_tool_call(self, request: ToolCallRequest, handler: Callable) -> ToolMessage:
         """Main middleware hook that wraps tool execution with compensation logic."""
         tool_name = request.tool_call["name"]
+        # Log middleware + shared comp log ids to confirm sharing across calls
+        logging.debug(f"Middleware id={id(self)} shared_comp_log_instance id={id(getattr(self, '_shared_comp_log_instance', None))}")
         state = request.state
 
         # Use global/shared compensation log if provided, else fall back to state dict
 
 
         def get_comp_log():
-            if self._comp_log_ref is not None:
-                # Always use a single, live CompensationLog instance for the shared log
-                if self._shared_comp_log_instance is None:
-                    self._shared_comp_log_instance = CompensationLog(records=self._comp_log_ref)
-                    print(f"[DEBUG] Created shared CompensationLog instance id={id(self._shared_comp_log_instance)} records_id={id(self._shared_comp_log_instance._records)}")
+            # Always use the live shared CompensationLog instance if present
+            if self._shared_comp_log_instance is not None:
                 return self._shared_comp_log_instance
+            # Fallback: use state dict (for legacy/standalone mode)
             return CompensationLog.from_dict(state.get("compensation_log", {}))
 
         def set_comp_log(comp_log: CompensationLog):
-            if self._comp_log_ref is not None:
-                # No-op: all mutations are in-place on the shared log
-                print(f"[DEBUG] set_comp_log: shared instance id={id(comp_log)} records_id={id(comp_log._records)}")
+            # No-op if using a live shared CompensationLog instance
+            if self._shared_comp_log_instance is not None:
                 return
-            else:
-                state["compensation_log"] = comp_log.to_dict()
-                print(f"[DEBUG] set_comp_log: state instance id={id(comp_log)} records_id={id(comp_log._records)}")
+            # Fallback: update state dict (legacy/standalone mode only)
+            state["compensation_log"] = comp_log.to_dict()
 
         # Cache this tool for potential compensation use
         self._cache_tool_from_request(request)
@@ -395,7 +406,7 @@ class CompensationMiddleware(AgentMiddleware):
             with self._lock:
                 comp_log = get_comp_log()
                 # Data Flow Dependency Inference:
-                print(f"Inferring dependencies for '{tool_name}'...")
+                logging.debug(f"Inferring dependencies for '{tool_name}'...")
                 depends_on = self._infer_dependencies(
                     request.tool_call.get("args", {}), comp_log
                 )
@@ -408,7 +419,7 @@ class CompensationMiddleware(AgentMiddleware):
                     depends_on=depends_on,
                 )
                 comp_log.add(record)
-                print(f"[DEBUG] After add: comp_log id={id(comp_log)} records_id={id(comp_log._records)} keys={list(comp_log._records.keys())}")
+                logging.debug(f"After add: comp_log id={id(comp_log)} records_id={id(comp_log._records)} keys={list(comp_log._records.keys())}")
                 set_comp_log(comp_log)
 
         # Execute the actual tool - catch exceptions and convert to error ToolMessages
@@ -435,11 +446,11 @@ class CompensationMiddleware(AgentMiddleware):
 
         # DEBUG: Print compensation log before rollback
         if is_error:
-            print("=== COMPENSATION LOG BEFORE ROLLBACK ===")
+            logging.info("=== COMPENSATION LOG BEFORE ROLLBACK ===")
             try:
-                print(json.dumps(get_comp_log().to_dict(), indent=2))
+                logging.info(json.dumps(get_comp_log().to_dict(), indent=2))
             except Exception as debug_exc:
-                print(f"[DEBUG] Failed to print compensation log: {debug_exc}")
+                logging.debug(f"Failed to print compensation log: {debug_exc}")
 
 
         with self._lock:
@@ -447,20 +458,20 @@ class CompensationMiddleware(AgentMiddleware):
             # Always use the action_id stored in request.state (if present)
             action_id_for_update = request.state.get("_comp_action_id", action_id)
             if is_error:
-                print(f"Tool '{tool_name}' failed. Rolling back...")
+                logging.error(f"Tool '{tool_name}' failed. Rolling back...")
 
                 # Update failed action status
                 if is_compensatable:
                     comp_log.update(
                         action_id_for_update, status="FAILED", result=self._extract_result(result)
                     )
-                    print(f"[DEBUG] After FAILED update: comp_log id={id(comp_log)} records_id={id(comp_log._records)} keys={list(comp_log._records.keys())}")
+                    logging.debug(f"After FAILED update: comp_log id={id(comp_log)} records_id={id(comp_log._records)} keys={list(comp_log._records.keys())}")
 
                 # Execute rollback plan in dependency order
                 plan = comp_log.get_rollback_plan()
                 for record in plan:
                     comp_tool = record["compensation_tool"]
-                    print(f"Rolling back '{record['tool_name']}' using '{comp_tool}'...")
+                    logging.info(f"Rolling back '{record['tool_name']}' using '{comp_tool}'...")
 
                     comp_params = self._map_params(record)
                     comp_result = self._execute_compensation(comp_tool, comp_params, request)
@@ -469,11 +480,12 @@ class CompensationMiddleware(AgentMiddleware):
                     if self._is_error(comp_result):
                         error_msg = f"CRITICAL: Compensation failed for '{record['tool_name']}' using '{comp_tool}'. "
                         error_msg += f"Result: {comp_result.content}. System may be in inconsistent state."
+                        logging.critical(error_msg)
                         raise SagaCriticalFailure(error_msg)
 
                     # Only mark as compensated if it actually succeeded
                     comp_log.mark_compensated(record["id"])
-                    print(f"[DEBUG] After mark_compensated: comp_log id={id(comp_log)} records_id={id(comp_log._records)} keys={list(comp_log._records.keys())}")
+                    logging.debug(f"After mark_compensated: comp_log id={id(comp_log)} records_id={id(comp_log._records)} keys={list(comp_log._records.keys())}")
 
                 set_comp_log(comp_log)
 
@@ -482,8 +494,8 @@ class CompensationMiddleware(AgentMiddleware):
                 comp_log.update(
                     action_id_for_update, status="COMPLETED", result=self._extract_result(result)
                 )
-                print(f"[DEBUG] Marked action {action_id_for_update} ({tool_name}) as COMPLETED in compensation log.")
-                print(f"[DEBUG] After COMPLETED update: comp_log id={id(comp_log)} records_id={id(comp_log._records)} keys={list(comp_log._records.keys())}")
+                logging.debug(f"Marked action {action_id_for_update} ({tool_name}) as COMPLETED in compensation log.")
+                logging.debug(f"After COMPLETED update: comp_log id={id(comp_log)} records_id={id(comp_log._records)} keys={list(comp_log._records.keys())}")
                 set_comp_log(comp_log)
 
         return result
