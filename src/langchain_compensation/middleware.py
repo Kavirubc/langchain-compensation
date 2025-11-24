@@ -59,10 +59,15 @@ class CompensationLog:
             self._records[record_id].update(kwargs)
 
     def get_rollback_plan(self) -> List[CompensationRecord]:
-        """Returns uncompensated completed actions in reverse dependency order.
+        """Returns uncompensated completed actions in reverse topological order.
         
-        Uses topological sort to ensure dependencies are compensated before their dependents.
-        For actions with no dependencies, falls back to reverse timestamp order (LIFO).
+        Uses reverse topological sort (Kahn's algorithm) to ensure that actions
+        are compensated in the correct order: dependents BEFORE dependencies.
+        
+        If Action B depends on Action A (B uses data from A), then B must be
+        compensated before A, since we're undoing operations in reverse order.
+        
+        For independent actions, uses reverse timestamp as tie-breaker (LIFO).
         """
         # Get all uncompensated completed actions
         candidates = [
@@ -77,31 +82,56 @@ class CompensationLog:
         # Build dependency graph
         id_to_record = {r["id"]: r for r in candidates}
         
-        # Calculate reverse topological order (compensate dependents before dependencies)
-        visited = set()
+        # Calculate in-degree for each node (how many nodes depend on it)
+        in_degree = {r["id"]: 0 for r in candidates}
+        
+        # Build adjacency list: for each node, track which nodes it depends on
+        # We need reverse adjacency: which nodes depend on THIS node
+        reverse_deps = {r["id"]: [] for r in candidates}
+        
+        for record in candidates:
+            for dep_id in record.get("depends_on", []):
+                if dep_id in id_to_record:
+                    # record depends on dep_id
+                    # So in reverse order, dep_id must come after record
+                    reverse_deps[dep_id].append(record["id"])
+                    in_degree[record["id"]] += 1
+        
+        # Kahn's algorithm for topological sort
+        # Start with nodes that have no dependencies (in_degree == 0)
+        queue = [r["id"] for r in candidates if in_degree[r["id"]] == 0]
+        
+        # Sort queue by reverse timestamp for deterministic LIFO ordering
+        queue.sort(key=lambda rid: id_to_record[rid]["timestamp"], reverse=True)
+        
         result = []
         
-        def visit(record_id: str) -> None:
-            if record_id in visited or record_id not in id_to_record:
-                return
+        while queue:
+            # Process node with no remaining dependencies
+            current_id = queue.pop(0)
+            result.append(id_to_record[current_id])
             
-            visited.add(record_id)
-            record = id_to_record[record_id]
-            
-            # Visit all records that depend on this one (they must be compensated first)
-            for other_id, other_record in id_to_record.items():
-                if record_id in other_record.get("depends_on", []):
-                    visit(other_id)
-            
-            result.append(record)
+            # For each node that was depending on current (in reverse graph)
+            for dependent_id in reverse_deps[current_id]:
+                in_degree[dependent_id] -= 1
+                if in_degree[dependent_id] == 0:
+                    # Insert in sorted position (by reverse timestamp)
+                    idx = 0
+                    dep_timestamp = id_to_record[dependent_id]["timestamp"]
+                    while idx < len(queue) and id_to_record[queue[idx]]["timestamp"] > dep_timestamp:
+                        idx += 1
+                    queue.insert(idx, dependent_id)
         
-        # Visit all nodes, prioritizing by reverse timestamp for tie-breaking
-        for record in sorted(candidates, key=lambda x: x["timestamp"], reverse=True):
-            visit(record["id"])
+        # Check for cycles (should never happen in a proper DAG)
+        if len(result) != len(candidates):
+            print("WARNING: Dependency cycle detected! Falling back to timestamp order.")
+            result = sorted(candidates, key=lambda x: x["timestamp"], reverse=True)
         
-        print(f"DEBUG get_rollback_plan: Returning {len(result)} actions in order:")
+        print(f"DEBUG get_rollback_plan: Returning {len(result)} actions in DAG order:")
         for r in result:
-            print(f"  - {r['tool_name']}")
+            deps = r.get("depends_on", [])
+            dep_info = f" (depends on {len(deps)} actions)" if deps else " (no dependencies)"
+            print(f"  - {r['tool_name']}{dep_info}")
         
         return result
 
@@ -206,6 +236,100 @@ class CompensationMiddleware(AgentMiddleware):
         # Default: assume success
         return False
 
+    def _extract_values(self, data: Any, visited: set | None = None) -> set:
+        """Recursively extract all primitive values from a data structure.
+        
+        Applies heuristic noise filtering to exclude low-entropy values that
+        cause false dependencies (e.g., True, False, 0, 1, "ok", "id").
+        
+        Args:
+            data: The data structure to extract values from
+            visited: Set of visited object IDs to prevent infinite recursion
+            
+        Returns:
+            Set of high-entropy primitive values suitable for dependency inference
+        """
+        if visited is None:
+            visited = set()
+        
+        # Prevent infinite recursion on circular references
+        obj_id = id(data)
+        if obj_id in visited:
+            return set()
+        visited.add(obj_id)
+        
+        values = set()
+        
+        if isinstance(data, dict):
+            for value in data.values():
+                values.update(self._extract_values(value, visited))
+        elif isinstance(data, (list, tuple)):
+            for item in data:
+                values.update(self._extract_values(item, visited))
+        elif isinstance(data, (str, int, float)):
+            # --- HEURISTIC NOISE FILTERING ---
+            # Exclude common noise that causes false dependencies:
+            # - Booleans (True/False appear everywhere)
+            # - Small numbers (0, 1, 100, 200, etc. are configuration, not unique IDs)
+            # - Short strings ("ok", "id", "USA" are not unique identifiers)
+            
+            if isinstance(data, bool):
+                # Never include booleans - they create massive false positive graphs
+                pass
+            elif isinstance(data, (int, float)) and abs(data) < 10000:
+                # Assume small numbers are configuration/status codes, not unique IDs
+                pass
+            elif isinstance(data, str) and len(data) < 5:
+                # Assume short strings are not unique identifiers
+                pass
+            elif data == "" or data is None:
+                # Exclude empty/null values
+                pass
+            else:
+                # High-entropy value: likely a unique ID, hash, or meaningful data
+                values.add(data)
+        
+        return values
+
+    def _infer_dependencies(
+        self, current_params: Dict[str, Any], comp_log: CompensationLog
+    ) -> List[str]:
+        """Infer dependencies by matching current params against previous results.
+        
+        This implements "Data Flow Dependency Inference" to build a true DAG.
+        If the current action's parameters contain values that were produced by
+        a previous action's result, then we have a data flow dependency.
+        
+        Args:
+            current_params: Parameters for the current tool call
+            comp_log: Current compensation log with history
+            
+        Returns:
+            List of record IDs that the current action depends on
+        """
+        dependencies = []
+        
+        # Extract all values from current parameters
+        param_values = self._extract_values(current_params)
+        
+        if not param_values:
+            return dependencies
+        
+        # Check each completed action to see if it produced data we're consuming
+        for record in comp_log._records.values():
+            if record["status"] != "COMPLETED" or record["compensated"]:
+                continue
+            
+            # Extract all values from this record's result
+            result_values = self._extract_values(record["result"])
+            
+            # Check for data flow: do any param values match result values?
+            if param_values & result_values:  # Set intersection
+                dependencies.append(record["id"])
+                print(f"  Data flow detected: Current action depends on '{record['tool_name']}' (ID: {record['id'][:8]}...)")
+        
+        return dependencies
+
     def _map_params(self, record: CompensationRecord) -> Any:
         """Maps compensation tool parameters from original result."""
         # Use custom mapper if available
@@ -277,10 +401,14 @@ class CompensationMiddleware(AgentMiddleware):
                 # Always reload from state to get latest records (avoid lost updates)
                 comp_log = CompensationLog.from_dict(state.get("compensation_log", {}))
                 
-                # Simplified: No explicit dependency tracking needed.
-                # LIFO rollback is handled by timestamp ordering in get_rollback_plan().
-                # The dependency graph was creating O(N^2) complexity without adding value
-                # since rollback already processes in reverse chronological order.
+                # Data Flow Dependency Inference:
+                # Automatically detect which previous actions this one depends on
+                # by checking if any parameter values match previous results.
+                # This builds a true DAG based on actual data flow.
+                print(f"Inferring dependencies for '{tool_name}'...")
+                depends_on = self._infer_dependencies(
+                    request.tool_call.get("args", {}), comp_log
+                )
                 
                 record = CompensationRecord(
                     id=action_id,
@@ -288,7 +416,7 @@ class CompensationMiddleware(AgentMiddleware):
                     params=request.tool_call.get("args", {}),
                     timestamp=time.time(),
                     compensation_tool=self.compensation_mapping[tool_name],
-                    depends_on=[],  # Empty - rely on timestamp ordering
+                    depends_on=depends_on,
                 )
                 comp_log.add(record)
                 state["compensation_log"] = comp_log.to_dict()
