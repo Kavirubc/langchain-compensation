@@ -43,113 +43,79 @@ class CompensationRecord(dict):
         )
 
 
+
 class CompensationLog:
-    """Manages compensation records with LIFO rollback ordering."""
+    """Manages compensation records with LIFO rollback ordering. Now thread-safe."""
 
     def __init__(self, records: Dict[str, CompensationRecord] | None = None):
-        self._records = records or {}
+        self._records = records if records is not None else {}
+        self._lock = threading.Lock()
 
     def add(self, record: CompensationRecord) -> None:
-        """Add a new compensation record."""
-        self._records[record["id"]] = record
+        with self._lock:
+            self._records[record["id"]] = record
 
     def update(self, record_id: str, **kwargs: Any) -> None:
-        """Update an existing record."""
-        if record_id in self._records:
-            self._records[record_id].update(kwargs)
+        with self._lock:
+            if record_id in self._records:
+                self._records[record_id].update(kwargs)
 
     def get_rollback_plan(self) -> List[CompensationRecord]:
-        """Returns uncompensated completed actions in reverse topological order.
-        
-        Uses reverse topological sort (Kahn's algorithm) to ensure that actions
-        are compensated in the correct order: dependents BEFORE dependencies.
-        
-        If Action B depends on Action A (B uses data from A), then B must be
-        compensated before A, since we're undoing operations in reverse order.
-        
-        For independent actions, uses reverse timestamp as tie-breaker (LIFO).
-        """
-        # Get all uncompensated completed actions
-        candidates = [
-            r
-            for r in self._records.values()
-            if r["status"] == "COMPLETED" and not r["compensated"] and r["compensation_tool"]
-        ]
-        
-        if not candidates:
-            return []
-        
-        # Build dependency graph
-        id_to_record = {r["id"]: r for r in candidates}
-        
-        # Calculate in-degree for each node (how many nodes depend on it)
-        in_degree = {r["id"]: 0 for r in candidates}
-        
-        # Build adjacency list: for each node, track which nodes it depends on
-        # We need reverse adjacency: which nodes depend on THIS node
-        reverse_deps = {r["id"]: [] for r in candidates}
-        
-        for record in candidates:
-            for dep_id in record.get("depends_on", []):
-                if dep_id in id_to_record:
-                    # record depends on dep_id
-                    # So in reverse order, dep_id must come after record
-                    reverse_deps[dep_id].append(record["id"])
-                    in_degree[record["id"]] += 1
-        
-        # Kahn's algorithm for topological sort
-        # Start with nodes that have no dependencies (in_degree == 0)
-        queue = [r["id"] for r in candidates if in_degree[r["id"]] == 0]
-        
-        # Sort queue by reverse timestamp for deterministic LIFO ordering
-        queue.sort(key=lambda rid: id_to_record[rid]["timestamp"], reverse=True)
-        
-        result = []
-        
-        while queue:
-            # Process node with no remaining dependencies
-            current_id = queue.pop(0)
-            result.append(id_to_record[current_id])
-            
-            # For each node that was depending on current (in reverse graph)
-            for dependent_id in reverse_deps[current_id]:
-                in_degree[dependent_id] -= 1
-                if in_degree[dependent_id] == 0:
-                    # Insert in sorted position (by reverse timestamp)
-                    idx = 0
-                    dep_timestamp = id_to_record[dependent_id]["timestamp"]
-                    while idx < len(queue) and id_to_record[queue[idx]]["timestamp"] > dep_timestamp:
-                        idx += 1
-                    queue.insert(idx, dependent_id)
-        
-        # Check for cycles (should never happen in a proper DAG)
-        if len(result) != len(candidates):
-            print("WARNING: Dependency cycle detected! Falling back to timestamp order.")
-            result = sorted(candidates, key=lambda x: x["timestamp"], reverse=True)
-        
-        print(f"DEBUG get_rollback_plan: Returning {len(result)} actions in DAG order:")
-        for r in result:
-            deps = r.get("depends_on", [])
-            dep_info = f" (depends on {len(deps)} actions)" if deps else " (no dependencies)"
-            print(f"  - {r['tool_name']}{dep_info}")
-        
-        return result
+        with self._lock:
+            candidates = [
+                r
+                for r in self._records.values()
+                if r["status"] == "COMPLETED" and not r["compensated"] and r["compensation_tool"]
+            ]
+            if not candidates:
+                return []
+            id_to_record = {r["id"]: r for r in candidates}
+            in_degree = {r["id"]: 0 for r in candidates}
+            reverse_deps = {r["id"]: [] for r in candidates}
+            for record in candidates:
+                for dep_id in record.get("depends_on", []):
+                    if dep_id in id_to_record:
+                        reverse_deps[dep_id].append(record["id"])
+                        in_degree[record["id"]] += 1
+            queue = [r["id"] for r in candidates if in_degree[r["id"]] == 0]
+            queue.sort(key=lambda rid: id_to_record[rid]["timestamp"], reverse=True)
+            result = []
+            while queue:
+                current_id = queue.pop(0)
+                result.append(id_to_record[current_id])
+                for dependent_id in reverse_deps[current_id]:
+                    in_degree[dependent_id] -= 1
+                    if in_degree[dependent_id] == 0:
+                        idx = 0
+                        dep_timestamp = id_to_record[dependent_id]["timestamp"]
+                        while idx < len(queue) and id_to_record[queue[idx]]["timestamp"] > dep_timestamp:
+                            idx += 1
+                        queue.insert(idx, dependent_id)
+            if len(result) != len(candidates):
+                print("WARNING: Dependency cycle detected! Falling back to timestamp order.")
+                result = sorted(candidates, key=lambda x: x["timestamp"], reverse=True)
+            print(f"DEBUG get_rollback_plan: Returning {len(result)} actions in DAG order:")
+            for r in result:
+                deps = r.get("depends_on", [])
+                dep_info = f" (depends on {len(deps)} actions)" if deps else " (no dependencies)"
+                print(f"  - {r['tool_name']}{dep_info}")
+            return result
 
     def mark_compensated(self, record_id: str) -> None:
-        """Mark an action as compensated."""
-        if record_id in self._records:
-            self._records[record_id]["compensated"] = True
+        with self._lock:
+            if record_id in self._records:
+                self._records[record_id]["compensated"] = True
 
     def to_dict(self) -> Dict[str, CompensationRecord]:
-        """Export log as dictionary."""
-        return self._records
+        with self._lock:
+            return dict(self._records)
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "CompensationLog":
-        """Create log from dictionary."""
-        if isinstance(data, list):  # Handle legacy format
+        if isinstance(data, list):
             return cls()
         return cls(records={k: CompensationRecord(**v) for k, v in data.items()})
+
 
 
 class CompensationMiddleware(AgentMiddleware):
@@ -160,6 +126,7 @@ class CompensationMiddleware(AgentMiddleware):
         compensation_mapping: Dict[str, str],
         tools: Any = None,
         state_mappers: Dict[str, Callable[[Any, Dict[str, Any]], Dict[str, Any]]] | None = None,
+        comp_log_ref: dict | None = None,
     ):
         """
         Initialize compensation middleware.
@@ -169,11 +136,14 @@ class CompensationMiddleware(AgentMiddleware):
                 (e.g., {"book_flight": "cancel_flight"})
             tools: List of tools to cache for compensation execution
             state_mappers: Optional custom mappers to extract params from results for compensation
+            comp_log_ref: Optional external dict to use as the global compensation log (shared across agents)
         """
         self.compensation_mapping = compensation_mapping
         self.state_mappers = state_mappers or {}
         self._tools_cache: Dict[str, Any] = {}
         self._lock = threading.Lock()
+        self._comp_log_ref = comp_log_ref
+        self._shared_comp_log_instance = None
 
         # Cache all tools upfront for compensation use
         if tools:
@@ -384,32 +354,51 @@ class CompensationMiddleware(AgentMiddleware):
                 status="error",
             )
 
+
     def wrap_tool_call(self, request: ToolCallRequest, handler: Callable) -> ToolMessage:
         """Main middleware hook that wraps tool execution with compensation logic."""
         tool_name = request.tool_call["name"]
         state = request.state
 
+        # Use global/shared compensation log if provided, else fall back to state dict
+
+
+        def get_comp_log():
+            if self._comp_log_ref is not None:
+                # Always use a single, live CompensationLog instance for the shared log
+                if self._shared_comp_log_instance is None:
+                    self._shared_comp_log_instance = CompensationLog(records=self._comp_log_ref)
+                    print(f"[DEBUG] Created shared CompensationLog instance id={id(self._shared_comp_log_instance)} records_id={id(self._shared_comp_log_instance._records)}")
+                return self._shared_comp_log_instance
+            return CompensationLog.from_dict(state.get("compensation_log", {}))
+
+        def set_comp_log(comp_log: CompensationLog):
+            if self._comp_log_ref is not None:
+                # No-op: all mutations are in-place on the shared log
+                print(f"[DEBUG] set_comp_log: shared instance id={id(comp_log)} records_id={id(comp_log._records)}")
+                return
+            else:
+                state["compensation_log"] = comp_log.to_dict()
+                print(f"[DEBUG] set_comp_log: state instance id={id(comp_log)} records_id={id(comp_log._records)}")
+
         # Cache this tool for potential compensation use
         self._cache_tool_from_request(request)
 
+
         is_compensatable = tool_name in self.compensation_mapping
         action_id = str(uuid.uuid4())
+        # Store action_id in request.state for later update
+        request.state["_comp_action_id"] = action_id
 
         # Track compensatable action before execution
         if is_compensatable:
             with self._lock:
-                # Always reload from state to get latest records (avoid lost updates)
-                comp_log = CompensationLog.from_dict(state.get("compensation_log", {}))
-                
+                comp_log = get_comp_log()
                 # Data Flow Dependency Inference:
-                # Automatically detect which previous actions this one depends on
-                # by checking if any parameter values match previous results.
-                # This builds a true DAG based on actual data flow.
                 print(f"Inferring dependencies for '{tool_name}'...")
                 depends_on = self._infer_dependencies(
                     request.tool_call.get("args", {}), comp_log
                 )
-                
                 record = CompensationRecord(
                     id=action_id,
                     tool_name=tool_name,
@@ -419,56 +408,82 @@ class CompensationMiddleware(AgentMiddleware):
                     depends_on=depends_on,
                 )
                 comp_log.add(record)
-                state["compensation_log"] = comp_log.to_dict()
+                print(f"[DEBUG] After add: comp_log id={id(comp_log)} records_id={id(comp_log._records)} keys={list(comp_log._records.keys())}")
+                set_comp_log(comp_log)
 
-        # Execute the actual tool
-        result = handler(request)
+        # Execute the actual tool - catch exceptions and convert to error ToolMessages
+        try:
+            result = handler(request)
+        except Exception as e:
+            # Convert exceptions to ToolMessages with error status
+            result = ToolMessage(
+                content=f"Tool execution failed: {str(e)}",
+                tool_call_id=request.tool_call.get("id", str(uuid.uuid4())),
+                name=tool_name,
+                status="error"
+            )
+
 
         if not isinstance(result, ToolMessage):
-            return result
+            result = ToolMessage(
+                content=result,
+                tool_call_id=request.tool_call.get("id", str(uuid.uuid4())),
+                name=tool_name,
+            )
 
         is_error = self._is_error(result)
 
+        # DEBUG: Print compensation log before rollback
+        if is_error:
+            print("=== COMPENSATION LOG BEFORE ROLLBACK ===")
+            try:
+                print(json.dumps(get_comp_log().to_dict(), indent=2))
+            except Exception as debug_exc:
+                print(f"[DEBUG] Failed to print compensation log: {debug_exc}")
+
+
         with self._lock:
-            # Always reload from state before making updates
-            comp_log = CompensationLog.from_dict(state.get("compensation_log", {}))
-            
+            comp_log = get_comp_log()
+            # Always use the action_id stored in request.state (if present)
+            action_id_for_update = request.state.get("_comp_action_id", action_id)
             if is_error:
                 print(f"Tool '{tool_name}' failed. Rolling back...")
 
                 # Update failed action status
                 if is_compensatable:
                     comp_log.update(
-                        action_id, status="FAILED", result=self._extract_result(result)
+                        action_id_for_update, status="FAILED", result=self._extract_result(result)
                     )
+                    print(f"[DEBUG] After FAILED update: comp_log id={id(comp_log)} records_id={id(comp_log._records)} keys={list(comp_log._records.keys())}")
 
                 # Execute rollback plan in dependency order
                 plan = comp_log.get_rollback_plan()
-                
                 for record in plan:
                     comp_tool = record["compensation_tool"]
                     print(f"Rolling back '{record['tool_name']}' using '{comp_tool}'...")
 
                     comp_params = self._map_params(record)
                     comp_result = self._execute_compensation(comp_tool, comp_params, request)
-                    
+
                     # Verify compensation succeeded using strict error detection
                     if self._is_error(comp_result):
-                        # Compensation failed - system is in inconsistent state
                         error_msg = f"CRITICAL: Compensation failed for '{record['tool_name']}' using '{comp_tool}'. "
                         error_msg += f"Result: {comp_result.content}. System may be in inconsistent state."
                         raise SagaCriticalFailure(error_msg)
-                    
+
                     # Only mark as compensated if it actually succeeded
                     comp_log.mark_compensated(record["id"])
+                    print(f"[DEBUG] After mark_compensated: comp_log id={id(comp_log)} records_id={id(comp_log._records)} keys={list(comp_log._records.keys())}")
 
-                state["compensation_log"] = comp_log.to_dict()
+                set_comp_log(comp_log)
 
             elif is_compensatable:
                 # Mark successful compensatable action as completed
                 comp_log.update(
-                    action_id, status="COMPLETED", result=self._extract_result(result)
+                    action_id_for_update, status="COMPLETED", result=self._extract_result(result)
                 )
-                state["compensation_log"] = comp_log.to_dict()
+                print(f"[DEBUG] Marked action {action_id_for_update} ({tool_name}) as COMPLETED in compensation log.")
+                print(f"[DEBUG] After COMPLETED update: comp_log id={id(comp_log)} records_id={id(comp_log._records)} keys={list(comp_log._records.keys())}")
+                set_comp_log(comp_log)
 
         return result

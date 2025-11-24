@@ -1,15 +1,20 @@
+
 # LangChain Compensation
 
-Automatic compensation middleware for LangChain agents with LIFO (Last-In-First-Out) rollback capabilities. Inspired by the Saga pattern, this package provides automatic rollback of completed actions when a failure occurs in a multi-step agent workflow.
+**v0.3.0** — Automatic compensation middleware for LangChain agents with strict error handling, dependency-aware DAG rollback, and robust multi-agent support. Inspired by the Saga pattern, this package provides automatic rollback of completed actions when a failure occurs in a multi-step agent workflow.
+
 
 ## Features
 
-- 🔄 **Automatic Rollback**: Automatically compensates completed actions when failures occur
-- 📚 **LIFO Order**: Rolls back actions in reverse chronological order (like a transaction stack)
+- 🔄 **Automatic Rollback**: Compensates completed actions when failures occur
+- 🕸️ **Dependency-Aware DAG Rollback**: Rolls back actions in correct dependency order (not just LIFO)
+- 🚦 **Strict Error Handling**: Only explicit errors or exceptions trigger rollback (no heuristics)
+- 🤝 **Multi-Agent Support**: Use a shared middleware instance for global compensation across agents
 - 🎯 **Simple API**: Easy-to-use agent factory with compensation mapping
 - 🔧 **Flexible**: Support for custom state mappers to extract compensation parameters
 - 🧵 **Thread-Safe**: Built with thread safety in mind
 - 📦 **Zero Config**: Works out of the box with sensible defaults
+
 
 ## Installation
 
@@ -17,7 +22,8 @@ Automatic compensation middleware for LangChain agents with LIFO (Last-In-First-
 pip install langchain-compensation
 ```
 
-## Quick Start
+
+## Quick Start (v0.3.0)
 
 ```python
 from langchain_compensation import create_comp_agent
@@ -47,15 +53,26 @@ def cancel_hotel(booking_id: str) -> str:
     """Cancels a hotel booking."""
     return "Cancellation successful"
 
-# Create agent with compensation
-model = ChatGoogleGenerativeAI(model="gemini-2.0-flash-exp")
+# Create a single shared middleware instance for multi-agent workflows:
+# (New in v0.3.0)
+from langchain_compensation import CompensationMiddleware
+
+comp_middleware = CompensationMiddleware(
+    compensation_mapping={
+        "book_flight": "cancel_flight",
+        "book_hotel": "cancel_hotel"
+    },
+    tools=[book_flight, cancel_flight, book_hotel, cancel_hotel]
+)
+
 agent = create_comp_agent(
     model=model,
     tools=[book_flight, cancel_flight, book_hotel, cancel_hotel],
     compensation_mapping={
         "book_flight": "cancel_flight",
         "book_hotel": "cancel_hotel"
-    }
+    },
+    middleware=[comp_middleware]  # Pass the shared middleware instance
 )
 
 # Run the agent
@@ -65,11 +82,12 @@ result = agent.invoke({
 # When hotel booking fails, the flight booking is automatically cancelled!
 ```
 
+
 ## How It Works
 
 1. **Track Actions**: Compensatable actions are tracked in the agent's state
-2. **Detect Failures**: When a tool returns an error, the middleware detects it
-3. **Automatic Rollback**: All completed compensatable actions are rolled back in LIFO order
+2. **Detect Failures**: When a tool returns an explicit error or exception, the middleware detects it
+3. **Automatic Rollback**: All completed compensatable actions are rolled back in dependency order (DAG, not just LIFO)
 4. **Continue**: The agent continues with the rolled-back state
 
 ## Advanced Usage
@@ -140,6 +158,7 @@ The core middleware that handles compensation logic.
 - **Multi-step Workflows**: Undo completed steps when later steps fail
 - **Database Operations**: Rollback related operations in distributed systems
 - **API Integrations**: Clean up created resources when workflows fail
+
 
 ## Requirements
 
