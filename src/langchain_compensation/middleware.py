@@ -10,6 +10,11 @@ from langchain_core.messages import ToolMessage
 from langchain.agents.middleware.types import AgentMiddleware, ToolCallRequest
 
 
+class SagaCriticalFailure(Exception):
+    """Raised when a compensation action fails, indicating the system is in an inconsistent state."""
+    pass
+
+
 class CompensationRecord(dict):
     """Tracks a compensatable action. Inherits dict for easy serialization."""
 
@@ -180,28 +185,26 @@ class CompensationMiddleware(AgentMiddleware):
         return content
 
     def _is_error(self, result: ToolMessage) -> bool:
-        """Detects if tool result indicates an error."""
+        """Detects if tool result indicates an error using strict criteria only.
+        
+        Returns True only if:
+        - ToolMessage has status="error"
+        - Content is a dict with {"status": "error"}
+        - An actual Exception was caught (handled by caller)
+        
+        Does NOT use heuristic keyword matching to avoid false positives.
+        """
+        # Check ToolMessage status attribute
         if hasattr(result, "status") and result.status == "error":
             return True
 
+        # Check content dict for explicit error status
         content = result.content
         if isinstance(content, dict) and content.get("status") == "error":
             return True
 
-        # Check for error keywords in content
-        content_str = str(content).lower()
-        return any(
-            keyword in content_str
-            for keyword in [
-                "error:",
-                "error",
-                "failed",
-                "exception",
-                "traceback",
-                "cannot",
-                "unable to",
-            ]
-        )
+        # Default: assume success
+        return False
 
     def _map_params(self, record: CompensationRecord) -> Any:
         """Maps compensation tool parameters from original result."""
@@ -274,13 +277,10 @@ class CompensationMiddleware(AgentMiddleware):
                 # Always reload from state to get latest records (avoid lost updates)
                 comp_log = CompensationLog.from_dict(state.get("compensation_log", {}))
                 
-                # Determine dependencies: this action depends on all previous completed actions
-                # This ensures proper rollback order for sequential operations
-                depends_on = [
-                    r["id"]
-                    for r in comp_log._records.values()
-                    if r["status"] == "COMPLETED" and not r["compensated"]
-                ]
+                # Simplified: No explicit dependency tracking needed.
+                # LIFO rollback is handled by timestamp ordering in get_rollback_plan().
+                # The dependency graph was creating O(N^2) complexity without adding value
+                # since rollback already processes in reverse chronological order.
                 
                 record = CompensationRecord(
                     id=action_id,
@@ -288,7 +288,7 @@ class CompensationMiddleware(AgentMiddleware):
                     params=request.tool_call.get("args", {}),
                     timestamp=time.time(),
                     compensation_tool=self.compensation_mapping[tool_name],
-                    depends_on=depends_on,
+                    depends_on=[],  # Empty - rely on timestamp ordering
                 )
                 comp_log.add(record)
                 state["compensation_log"] = comp_log.to_dict()
@@ -322,7 +322,16 @@ class CompensationMiddleware(AgentMiddleware):
                     print(f"Rolling back '{record['tool_name']}' using '{comp_tool}'...")
 
                     comp_params = self._map_params(record)
-                    self._execute_compensation(comp_tool, comp_params, request)
+                    comp_result = self._execute_compensation(comp_tool, comp_params, request)
+                    
+                    # Verify compensation succeeded using strict error detection
+                    if self._is_error(comp_result):
+                        # Compensation failed - system is in inconsistent state
+                        error_msg = f"CRITICAL: Compensation failed for '{record['tool_name']}' using '{comp_tool}'. "
+                        error_msg += f"Result: {comp_result.content}. System may be in inconsistent state."
+                        raise SagaCriticalFailure(error_msg)
+                    
+                    # Only mark as compensated if it actually succeeded
                     comp_log.mark_compensated(record["id"])
 
                 state["compensation_log"] = comp_log.to_dict()
