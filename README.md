@@ -1,7 +1,7 @@
 
 # LangChain Compensation
 
-**v0.3.0** — Automatic compensation middleware for LangChain agents with strict error handling, dependency-aware DAG rollback, and robust multi-agent support. Inspired by the Saga pattern, this package provides automatic rollback of completed actions when a failure occurs in a multi-step agent workflow.
+**v0.3.1** — Automatic compensation middleware for LangChain agents with strict error handling, dependency-aware DAG rollback, and robust multi-agent support. Inspired by the Saga pattern, this package provides automatic rollback of completed actions when a failure occurs in a multi-step agent workflow.
 
 
 ## Features
@@ -23,7 +23,7 @@ pip install langchain-compensation
 ```
 
 
-## Quick Start (v0.3.0)
+## Quick Start (v0.3.1)
 
 ```python
 from langchain_compensation import create_comp_agent
@@ -54,7 +54,7 @@ def cancel_hotel(booking_id: str) -> str:
     return "Cancellation successful"
 
 # Create a single shared middleware instance for multi-agent workflows:
-# (New in v0.3.0)
+# (New in v0.3.1)
 from langchain_compensation import CompensationMiddleware
 
 comp_middleware = CompensationMiddleware(
