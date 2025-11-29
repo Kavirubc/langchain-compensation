@@ -215,6 +215,15 @@ class CompensationMiddleware(AgentMiddleware):
         content = result.content
         if isinstance(content, dict) and content.get("status") == "error":
             return True
+        
+        # Also check if content is a JSON string with error status
+        if isinstance(content, str):
+            try:
+                parsed = json.loads(content)
+                if isinstance(parsed, dict) and parsed.get("status") == "error":
+                    return True
+            except (json.JSONDecodeError, TypeError):
+                pass
 
         # Default: assume success
         return False
