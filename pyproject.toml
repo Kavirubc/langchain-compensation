@@ -4,17 +4,17 @@ build-backend = "hatchling.build"
 
 [project]
 name = "langchain-compensation"
-version = "0.3.1"
-description = "Automatic compensation middleware for LangChain agents with dependency-aware rollback"
+version = "0.4.0"
+description = "Composable compensation middleware for LangChain agents with automatic rollback, pluggable strategies, multi-agent support, and LLM-driven parameter extraction"
 readme = "README.md"
 requires-python = ">=3.9"
 license = {text = "MIT"}
 authors = [
     {name = "Kaviru", email = "hapuarachchikaviru@gmail.com"}
 ]
-keywords = ["langchain", "agents", "compensation", "rollback", "middleware", "saga"]
+keywords = ["langchain", "agents", "compensation", "rollback", "middleware", "saga", "multi-agent", "fault-tolerance"]
 classifiers = [
-    "Development Status :: 3 - Alpha",
+    "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
     "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
@@ -22,6 +22,9 @@ classifiers = [
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 
 dependencies = [
@@ -31,6 +34,19 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# LLM extraction with OpenAI models
+openai = [
+    "langchain-openai>=0.1.0",
+]
+# LLM extraction with Anthropic models
+anthropic = [
+    "langchain-anthropic>=0.1.0",
+]
+# All LLM providers
+llm = [
+    "langchain-openai>=0.1.0",
+    "langchain-anthropic>=0.1.0",
+]
 dev = [
     "pytest>=7.0.0",
     "pytest-asyncio>=0.21.0",
