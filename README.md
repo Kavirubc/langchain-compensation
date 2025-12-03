@@ -1,6 +1,6 @@
 # LangChain Compensation
 
-**v0.4.0** — Composable compensation middleware for LangChain agents with automatic rollback, pluggable strategies, multi-agent support, and LLM-driven parameter extraction. Implements the Saga pattern for distributed transactions in agent workflows.
+**v0.4.1** — Composable compensation middleware for LangChain agents with automatic rollback, pluggable strategies, multi-agent support, and LLM-driven parameter extraction. Implements the Saga pattern for distributed transactions in agent workflows.
 
 [![PyPI version](https://badge.fury.io/py/langchain-compensation.svg)](https://badge.fury.io/py/langchain-compensation)
 [![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
@@ -85,6 +85,86 @@ result = agent.invoke({
 ```
 
 The compensation log tracks all compensatable actions with their results, enabling intelligent parameter extraction for compensation calls.
+
+---
+
+## Using CompensationMiddleware with `create_agent`
+
+While `create_comp_agent` is the recommended way to get started, you can also use `CompensationMiddleware` directly with `create_agent` for more control:
+
+```python
+from langchain.agents import create_agent
+from langchain_compensation.middleware import CompensationMiddleware
+
+# Define your tools
+@tool
+def book_flight(destination: str) -> str:
+    """Books a flight."""
+    return f"flight_id_for_{destination}"
+
+@tool
+def cancel_flight(booking_id: str) -> str:
+    """Cancels a flight."""
+    return "Cancelled"
+
+# Create the compensation middleware
+comp_middleware = CompensationMiddleware(
+    compensation_mapping={
+        "book_flight": "cancel_flight",
+    },
+    tools=[book_flight, cancel_flight],  # Required for compensation execution
+    state_mappers={  # Optional: custom parameter extraction
+        "book_flight": lambda result, params: {"booking_id": result}
+    },
+)
+
+# Create agent with middleware
+agent = create_agent(
+    model="gpt-4o",
+    tools=[book_flight, cancel_flight],
+    middleware=[comp_middleware],  # Pass middleware as a list
+    system_prompt="You are a helpful travel assistant.",
+)
+```
+
+### CompensationMiddleware Parameters
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `compensation_mapping` | dict | **Required.** Maps tool names to compensation tools |
+| `tools` | list | Tools needed to execute compensations |
+| `state_mappers` | dict | Custom functions to extract compensation parameters |
+| `shared_log` | CompensationLog | Shared log for multi-agent coordination |
+| `agent_id` | str | Identifier for this agent instance |
+| `compensation_schemas` | dict | Declarative schemas for parameter extraction |
+| `error_strategies` | list | Custom error detection strategies |
+| `extraction_strategies` | list | Custom parameter extraction strategies |
+
+### `create_comp_agent` vs `create_agent` + Middleware
+
+| Feature | `create_comp_agent` | `create_agent` + Middleware |
+|---------|-------------------|---------------------------|
+| **Setup Required** | Minimal - single function call | More boilerplate |
+| **LLM Extraction** | Automatic with `use_llm_extraction=True` | Manual strategy building |
+| **Checkpointing** | Auto-configured with `use_checkpointing=True` | Manual middleware stacking |
+| **Recursion Limit** | Auto-set to 1000 | Must set manually |
+| **Human-in-the-Loop** | Auto-added with `interrupt_on` | Manual middleware stacking |
+| **Control** | Limited - opinionated setup | Full control over middleware stack |
+| **Learning Curve** | Shallow - get started quickly | Steeper - need middleware knowledge |
+
+**When to use each:**
+
+- **Use `create_comp_agent`** for:
+  - Getting started quickly
+  - Standard compensation patterns
+  - Using LLM extraction or checkpointing
+  - Minimal boilerplate preferred
+
+- **Use `create_agent` + Middleware** for:
+  - Fine-grained control over middleware ordering
+  - Combining with other custom middleware
+  - Debugging middleware behavior
+  - Complex middleware stacks
 
 ---
 
