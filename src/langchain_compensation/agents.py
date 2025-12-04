@@ -75,6 +75,11 @@ def create_comp_agent(
     use_llm_extraction: bool = False,
     extraction_model: str = "gpt-4o-mini",
     use_checkpointing: bool = False,
+    # Parallel execution control (v2.1)
+    enable_batch_abort: bool = True,
+    track_intent: bool = False,
+    batch_time_window_ms: float = 50,
+    disable_parallel_tool_calls: bool | str = False,
     # Standard agent parameters
     system_prompt: str | None = None,
     middleware: Sequence[AgentMiddleware] = (),
@@ -121,6 +126,19 @@ def create_comp_agent(
         use_checkpointing: If True, adds CheckpointMiddleware for state persistence.
             Requires checkpointer parameter to be set.
         checkpointer: LangGraph checkpointer for state persistence (e.g., PostgresSaver).
+
+        # Parallel Execution Control:
+        enable_batch_abort: If True (default), enables fail-fast behavior for parallel
+            tool calls. When one tool fails, other tools in the same batch will be
+            aborted before execution.
+        track_intent: If True, tracks LLM's intended tool calls vs actual execution
+            for debugging. Creates IntentDAG for observability.
+        batch_time_window_ms: Time window in ms for detecting parallel batches (default: 50).
+        disable_parallel_tool_calls: If True or "auto", attempts to disable parallel
+            tool calls at the model level. Only supported for OpenAI-compatible models.
+            - True: Force disable parallel tool calls
+            - False: Allow parallel execution (default)
+            - "auto": Auto-detect based on model capabilities
 
         # Standard Agent Parameters:
         system_prompt: Additional instructions for the agent.
@@ -216,7 +234,7 @@ def create_comp_agent(
         from .checkpoint import CheckpointMiddleware
         agent_middleware.append(CheckpointMiddleware(checkpointer=checkpointer))
 
-    # Add compensation middleware
+    # Add compensation middleware with parallel execution control
     comp_middleware = CompensationMiddleware(
         compensation_mapping=compensation_mapping,
         tools=tools,
@@ -227,8 +245,35 @@ def create_comp_agent(
         compensation_schemas=compensation_schemas,
         error_strategies=error_strategies,
         extraction_strategies=final_extraction_strategies,
+        enable_batch_abort=enable_batch_abort,
+        track_intent=track_intent,
+        batch_time_window_ms=batch_time_window_ms,
     )
     agent_middleware.append(comp_middleware)
+
+    # Handle model-level parallel tool call disabling
+    final_model = model
+    if disable_parallel_tool_calls:
+        should_disable = False
+
+        if disable_parallel_tool_calls == "auto":
+            # Auto-detect: check if model supports parallel_tool_calls parameter
+            if hasattr(model, "bind_tools"):
+                # OpenAI-compatible models typically support this
+                model_name = getattr(model, "model_name", "") or str(model)
+                should_disable = any(
+                    name in model_name.lower()
+                    for name in ["gpt-4", "gpt-3.5", "openai"]
+                )
+        else:
+            should_disable = True
+
+        if should_disable and hasattr(model, "bind_tools") and tools:
+            try:
+                final_model = model.bind_tools(tools, parallel_tool_calls=False)
+            except TypeError:
+                # Model doesn't support parallel_tool_calls parameter
+                pass
 
     # Add user-provided middleware
     if middleware:
@@ -239,7 +284,7 @@ def create_comp_agent(
         agent_middleware.append(HumanInTheLoopMiddleware(interrupt_on=interrupt_on))
 
     return create_agent(
-        model,
+        final_model,
         system_prompt=(
             system_prompt + "\n\n" + BASE_AGENT_PROMPT if system_prompt else BASE_AGENT_PROMPT
         ),

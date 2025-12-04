@@ -78,7 +78,16 @@ from .extraction import (
 # Checkpoint middleware for fault tolerance
 from .checkpoint import CheckpointMiddleware
 
-__version__ = "0.4.0"
+# Batch execution handling for parallel tool calls
+from .batch import (
+    BatchContext,
+    IntentNode,
+    IntentDAG,
+    BatchDetector,
+    BatchManager,
+)
+
+__version__ = "0.5.0"
 
 __all__ = [
     # Core
@@ -107,4 +116,10 @@ __all__ = [
     "create_extraction_strategy",
     # Checkpoint
     "CheckpointMiddleware",
+    # Batch execution
+    "BatchContext",
+    "IntentNode",
+    "IntentDAG",
+    "BatchDetector",
+    "BatchManager",
 ]

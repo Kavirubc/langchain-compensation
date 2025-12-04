@@ -12,6 +12,8 @@ from langchain.agents.middleware import AgentMiddleware
 from langchain.tools.tool_node import ToolCallRequest
 from langgraph.types import Command
 
+from .batch import BatchManager, BatchContext
+
 
 class SagaCriticalFailure(Exception):
     """Raised when a compensation action fails, indicating the system is in an inconsistent state."""
@@ -285,17 +287,26 @@ class CompensationMiddleware(AgentMiddleware):
 
     Features:
     - Automatic LIFO rollback with DAG-based dependency ordering
+    - Batch abort gate for parallel tool execution (fail-fast)
     - Pluggable error detection strategies
     - Pluggable parameter extraction strategies
     - Multi-agent support via shared CompensationLog
     - Thread-safe for parallel tool execution
+    - Intent DAG tracking for debugging parallel execution issues
     - Explicit compensation schemas for precise control
 
     Example:
-        # Simple usage
+        # Simple usage (batch abort enabled by default)
         middleware = CompensationMiddleware(
             compensation_mapping={"book_flight": "cancel_flight"},
             tools=[book_flight, cancel_flight],
+        )
+
+        # With intent tracking for debugging parallel execution
+        middleware = CompensationMiddleware(
+            compensation_mapping={"book_flight": "cancel_flight"},
+            tools=[book_flight, cancel_flight],
+            track_intent=True,
         )
 
         # Advanced with shared log and schemas
@@ -325,6 +336,10 @@ class CompensationMiddleware(AgentMiddleware):
         compensation_schemas: Dict[str, Any] | None = None,
         error_strategies: List[Any] | None = None,
         extraction_strategies: List[Any] | None = None,
+        # Parallel execution control (v2.1)
+        enable_batch_abort: bool = True,
+        track_intent: bool = False,
+        batch_time_window_ms: float = 50,
     ):
         """
         Initialize compensation middleware.
@@ -347,6 +362,14 @@ class CompensationMiddleware(AgentMiddleware):
                 detection. If None, uses default strategies.
             extraction_strategies: List of ExtractionStrategy instances for
                 pluggable parameter extraction. If None, uses default strategies.
+            enable_batch_abort: If True (default), enables fail-fast behavior for
+                parallel tool calls. When one tool fails, other tools in the same
+                batch will be aborted before execution.
+            track_intent: If True, tracks LLM's intended tool calls vs actual
+                execution for debugging. Creates IntentDAG for observability.
+            batch_time_window_ms: Time window in milliseconds for detecting
+                parallel tool batches. Calls within this window from different
+                threads are considered part of the same batch. Default: 50ms.
         """
         self.compensation_mapping = compensation_mapping
         self.state_mappers = state_mappers or {}
@@ -359,6 +382,14 @@ class CompensationMiddleware(AgentMiddleware):
         self._extraction_strategies = extraction_strategies
         self._error_detector = None  # Lazy init
         self._param_extractor = None  # Lazy init
+
+        # Parallel execution control
+        self.enable_batch_abort = enable_batch_abort
+        self.track_intent = track_intent
+        self._batch_manager = BatchManager(
+            time_window_ms=batch_time_window_ms,
+            track_intent=track_intent,
+        )
 
         # Unified state management: handle both legacy and new parameter names
         self._comp_log: CompensationLog | None = None
@@ -616,10 +647,11 @@ class CompensationMiddleware(AgentMiddleware):
         """Main middleware hook that wraps tool execution with compensation logic.
 
         This method:
-        1. Records compensatable actions BEFORE execution (with PENDING status)
-        2. Executes the tool via the handler
-        3. On success: Updates record to COMPLETED
-        4. On failure: Triggers rollback of all COMPLETED actions in DAG order
+        1. Checks batch abort gate (if enabled) - skip if batch already failed
+        2. Records compensatable actions BEFORE execution (with PENDING status)
+        3. Executes the tool via the handler
+        4. On success: Updates record to COMPLETED
+        5. On failure: Signals batch abort, triggers rollback of COMPLETED actions
 
         Args:
             request: The tool call request containing tool_call, state, etc.
@@ -629,12 +661,59 @@ class CompensationMiddleware(AgentMiddleware):
             ToolMessage or Command from the tool execution
         """
         tool_name = request.tool_call["name"]
+        tool_call_id = request.tool_call.get("id", str(uuid.uuid4()))
         state = request.state
         is_compensatable = tool_name in self.compensation_mapping
         action_id = str(uuid.uuid4())
 
         # Get current thread ID for parallel execution tracking
         current_thread_id = str(threading.current_thread().ident)
+
+        # === BATCH ABORT GATE ===
+        # Detect if this tool is part of a parallel batch and check abort flag
+        batch_ctx = None
+        batch_id = None
+
+        if self.enable_batch_abort and is_compensatable:
+            # Detect batch via thread pattern
+            batch_id = self._batch_manager.detect_batch(
+                tool_name, current_thread_id, tool_call_id
+            )
+
+            if batch_id:
+                # Get or create batch context
+                # Estimate tool count from recent calls (will be refined as more calls arrive)
+                batch_ctx = self._batch_manager.get_or_create_context(
+                    batch_id=batch_id,
+                    tool_count=5,  # Initial estimate, adjusted dynamically
+                    tool_call_ids=[tool_call_id],
+                )
+
+                # Update intent DAG if tracking
+                if self.track_intent:
+                    intent_dag = self._batch_manager.get_intent_dag(batch_id)
+                    if intent_dag:
+                        intent_dag.mark_executing(tool_call_id)
+
+                # CHECK ABORT FLAG - fail fast if another tool in batch already failed
+                if batch_ctx.should_abort():
+                    logging.info(
+                        f"Tool '{tool_name}' aborted: batch {batch_id} failed "
+                        f"(trigger: {batch_ctx.failed_tool})"
+                    )
+
+                    # Update intent DAG
+                    if self.track_intent:
+                        intent_dag = self._batch_manager.get_intent_dag(batch_id)
+                        if intent_dag:
+                            intent_dag.mark_aborted(tool_call_id)
+
+                    return ToolMessage(
+                        content=f"Execution aborted: {batch_ctx.abort_reason}",
+                        tool_call_id=tool_call_id,
+                        name=tool_name,
+                        status="error",
+                    )
 
         # Track compensatable action BEFORE execution
         if is_compensatable:
@@ -656,9 +735,13 @@ class CompensationMiddleware(AgentMiddleware):
         try:
             result = handler(request)
         except Exception as e:
+            # Signal batch abort on exception
+            if batch_ctx:
+                batch_ctx.signal_abort(tool_name, tool_call_id, str(e))
+
             result = ToolMessage(
                 content=f"Tool execution failed: {str(e)}",
-                tool_call_id=request.tool_call.get("id", str(uuid.uuid4())),
+                tool_call_id=tool_call_id,
                 name=tool_name,
                 status="error",
             )
@@ -667,7 +750,7 @@ class CompensationMiddleware(AgentMiddleware):
         if not isinstance(result, ToolMessage):
             result = ToolMessage(
                 content=result,
-                tool_call_id=request.tool_call.get("id", str(uuid.uuid4())),
+                tool_call_id=tool_call_id,
                 name=tool_name,
             )
 
@@ -675,6 +758,17 @@ class CompensationMiddleware(AgentMiddleware):
 
         # Handle error: rollback all completed actions
         if is_error:
+            # Signal batch abort so other parallel tools can fail fast
+            if batch_ctx:
+                batch_ctx.signal_abort(tool_name, tool_call_id, str(result.content)[:200])
+
+            # Update intent DAG
+            if self.track_intent and batch_id:
+                intent_dag = self._batch_manager.get_intent_dag(batch_id)
+                if intent_dag:
+                    intent_dag.mark_failed(tool_call_id)
+                    intent_dag.abort_pending()  # Mark pending tools as aborted
+
             logging.error(f"Tool '{tool_name}' failed. Initiating rollback...")
             comp_log = self._get_comp_log(state)
 
@@ -698,8 +792,24 @@ class CompensationMiddleware(AgentMiddleware):
             self._sync_comp_log(comp_log, state)
 
         elif is_compensatable:
+            # Update intent DAG on success
+            if self.track_intent and batch_id:
+                intent_dag = self._batch_manager.get_intent_dag(batch_id)
+                if intent_dag:
+                    intent_dag.mark_completed(tool_call_id)
+
             comp_log = self._get_comp_log(state)
             comp_log.update(action_id, status="COMPLETED", result=self._extract_result(result))
             self._sync_comp_log(comp_log, state)
+
+        # Record batch execution for tracking
+        if batch_ctx:
+            executed_count = batch_ctx.record_execution(tool_call_id)
+
+            # Log batch report when complete (optional cleanup could be added here)
+            if batch_ctx.is_complete():
+                report = self._batch_manager.cleanup_batch(batch_id)
+                if report:
+                    logging.debug(f"Batch {batch_id} complete: {report}")
 
         return result
