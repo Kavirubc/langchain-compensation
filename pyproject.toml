@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "langchain-compensation"
-version = "0.5.0"
+version = "0.5.1"
 description = "Composable compensation middleware for LangChain agents with automatic rollback, pluggable strategies, multi-agent support, and LLM-driven parameter extraction"
 readme = "README.md"
 requires-python = ">=3.9"
