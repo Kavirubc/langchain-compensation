@@ -177,6 +177,23 @@ class TestMiddlewareBatchAbort:
         )
         assert middleware.enable_batch_abort is True
 
+    def test_sequential_execution_disabled_by_default(self):
+        """Test that sequential execution is disabled by default."""
+        middleware = CompensationMiddleware(
+            compensation_mapping={"test_tool": "undo_tool"},
+        )
+        assert middleware.sequential_execution is False
+
+    def test_sequential_execution_can_be_enabled(self):
+        """Test that sequential execution can be enabled."""
+        middleware = CompensationMiddleware(
+            compensation_mapping={"test_tool": "undo_tool"},
+            sequential_execution=True,
+        )
+        assert middleware.sequential_execution is True
+        assert middleware._batch_manager.is_sequential_execution_enabled() is True
+        assert middleware._batch_manager.get_sequential_lock() is not None
+
     def test_batch_abort_can_be_disabled(self):
         """Test that batch abort can be disabled."""
         middleware = CompensationMiddleware(

@@ -79,6 +79,7 @@ def create_comp_agent(
     enable_batch_abort: bool = True,
     track_intent: bool = False,
     batch_time_window_ms: float = 50,
+    sequential_execution: bool = False,
     disable_parallel_tool_calls: bool | str = False,
     # Standard agent parameters
     system_prompt: str | None = None,
@@ -134,6 +135,11 @@ def create_comp_agent(
         track_intent: If True, tracks LLM's intended tool calls vs actual execution
             for debugging. Creates IntentDAG for observability.
         batch_time_window_ms: Time window in ms for detecting parallel batches (default: 50).
+        sequential_execution: If True, forces sequential execution of compensatable
+            tools using a lock. This is the MOST RELIABLE way to prevent parallel
+            execution race conditions. When enabled, parallel tool calls execute one
+            at a time, and if one fails, subsequent tools are immediately aborted.
+            Recommended for critical workflows where parallel execution is problematic.
         disable_parallel_tool_calls: If True or "auto", attempts to disable parallel
             tool calls at the model level. Only supported for OpenAI-compatible models.
             - True: Force disable parallel tool calls
@@ -248,6 +254,7 @@ def create_comp_agent(
         enable_batch_abort=enable_batch_abort,
         track_intent=track_intent,
         batch_time_window_ms=batch_time_window_ms,
+        sequential_execution=sequential_execution,
     )
     agent_middleware.append(comp_middleware)
 

@@ -12,6 +12,7 @@ from langchain_compensation.batch import (
     BatchManager,
     IntentDAG,
     IntentNode,
+    SequentialExecutionLock,
 )
 
 
@@ -427,6 +428,96 @@ class TestBatchManager:
 
         manager.cleanup_batch("batch_1")
         assert manager.get_active_batch_count() == 1
+
+
+class TestSequentialExecutionLock:
+    """Tests for SequentialExecutionLock class."""
+
+    def test_initial_state(self):
+        """Test that lock starts with correct initial state."""
+        lock = SequentialExecutionLock()
+        assert not lock.should_abort()
+        failed_tool, reason = lock.get_abort_info()
+        assert failed_tool is None
+        assert reason is None
+
+    def test_signal_abort(self):
+        """Test abort signaling."""
+        lock = SequentialExecutionLock()
+
+        lock.signal_abort("tool_1", "Test failure")
+
+        assert lock.should_abort()
+        failed_tool, reason = lock.get_abort_info()
+        assert failed_tool == "tool_1"
+        assert reason == "Test failure"
+
+    def test_reset(self):
+        """Test lock reset."""
+        lock = SequentialExecutionLock()
+
+        lock.signal_abort("tool_1", "Test failure")
+        assert lock.should_abort()
+
+        lock.reset()
+        assert not lock.should_abort()
+
+    def test_execution_slot_context_manager(self):
+        """Test execution slot as context manager."""
+        lock = SequentialExecutionLock()
+
+        with lock.acquire_execution_slot("tc_1") as slot:
+            assert not slot.should_abort
+            slot.signal_abort("Test error")
+
+        # After exit, abort should be signaled
+        assert lock.should_abort()
+
+    def test_sequential_execution_with_abort(self):
+        """Test that sequential execution properly aborts after failure."""
+        lock = SequentialExecutionLock()
+        results = []
+
+        def execute_tool(tool_id, should_fail=False):
+            with lock.acquire_execution_slot(f"tc_{tool_id}") as slot:
+                if slot.should_abort:
+                    results.append((tool_id, "aborted", slot.abort_reason))
+                    return
+
+                # Simulate execution
+                time.sleep(0.01)
+
+                if should_fail:
+                    slot.signal_abort("Simulated failure")
+                    results.append((tool_id, "failed", None))
+                else:
+                    results.append((tool_id, "completed", None))
+
+        # Execute sequentially (simulating parallel threads acquiring lock)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+            futures = [
+                executor.submit(execute_tool, 1, False),
+                executor.submit(execute_tool, 2, True),  # Will fail
+                executor.submit(execute_tool, 3, False),
+                executor.submit(execute_tool, 4, False),
+                executor.submit(execute_tool, 5, False),
+            ]
+            concurrent.futures.wait(futures)
+
+        # Due to lock, execution is sequential
+        # After tool 2 fails, subsequent tools should abort
+        statuses = {r[0]: r[1] for r in results}
+
+        # All tools should have executed (lock serializes them)
+        assert len(results) == 5
+
+        # Tool 2 should have failed
+        assert statuses[2] == "failed"
+
+        # At least some tools after 2 should be aborted
+        # (depends on execution order, but tool 1 likely completed first)
+        aborted_count = sum(1 for r in results if r[1] == "aborted")
+        assert aborted_count >= 1, "At least one tool should be aborted after failure"
 
 
 class TestParallelRaceCondition:

@@ -1,0 +1,19 @@
+{
+	"folders": [
+		{
+			"path": "../REALM-Bench"
+		},
+		{
+			"path": "."
+		},
+		{
+			"path": "../SagaLLM"
+		},
+		{
+			"path": "../M-APPLE-OS"
+		},
+		{
+			"path": "../langchain-compensation-examples"
+		}
+	]
+}

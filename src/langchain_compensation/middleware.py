@@ -12,7 +12,7 @@ from langchain.agents.middleware import AgentMiddleware
 from langchain.tools.tool_node import ToolCallRequest
 from langgraph.types import Command
 
-from .batch import BatchManager, BatchContext
+from .batch import BatchManager, BatchContext, SequentialExecutionLock
 
 
 class SagaCriticalFailure(Exception):
@@ -340,6 +340,7 @@ class CompensationMiddleware(AgentMiddleware):
         enable_batch_abort: bool = True,
         track_intent: bool = False,
         batch_time_window_ms: float = 50,
+        sequential_execution: bool = False,
     ):
         """
         Initialize compensation middleware.
@@ -370,6 +371,11 @@ class CompensationMiddleware(AgentMiddleware):
             batch_time_window_ms: Time window in milliseconds for detecting
                 parallel tool batches. Calls within this window from different
                 threads are considered part of the same batch. Default: 50ms.
+            sequential_execution: If True, forces sequential execution of
+                compensatable tools using a lock. This is the most reliable way
+                to prevent parallel execution race conditions, but may impact
+                performance. When enabled, parallel tool calls will execute one
+                at a time, and if one fails, subsequent tools will be aborted.
         """
         self.compensation_mapping = compensation_mapping
         self.state_mappers = state_mappers or {}
@@ -386,9 +392,11 @@ class CompensationMiddleware(AgentMiddleware):
         # Parallel execution control
         self.enable_batch_abort = enable_batch_abort
         self.track_intent = track_intent
+        self.sequential_execution = sequential_execution
         self._batch_manager = BatchManager(
             time_window_ms=batch_time_window_ms,
             track_intent=track_intent,
+            sequential_execution=sequential_execution,
         )
 
         # Unified state management: handle both legacy and new parameter names
@@ -647,11 +655,12 @@ class CompensationMiddleware(AgentMiddleware):
         """Main middleware hook that wraps tool execution with compensation logic.
 
         This method:
-        1. Checks batch abort gate (if enabled) - skip if batch already failed
-        2. Records compensatable actions BEFORE execution (with PENDING status)
-        3. Executes the tool via the handler
-        4. On success: Updates record to COMPLETED
-        5. On failure: Signals batch abort, triggers rollback of COMPLETED actions
+        1. If sequential_execution enabled: acquires lock, checks abort after lock
+        2. Otherwise: checks batch abort gate (if enabled)
+        3. Records compensatable actions BEFORE execution (with PENDING status)
+        4. Executes the tool via the handler
+        5. On success: Updates record to COMPLETED
+        6. On failure: Signals abort, triggers rollback of COMPLETED actions
 
         Args:
             request: The tool call request containing tool_call, state, etc.
@@ -669,45 +678,58 @@ class CompensationMiddleware(AgentMiddleware):
         # Get current thread ID for parallel execution tracking
         current_thread_id = str(threading.current_thread().ident)
 
-        # === BATCH ABORT GATE ===
-        # Detect if this tool is part of a parallel batch and check abort flag
+        # === SEQUENTIAL EXECUTION MODE ===
+        # If enabled, use lock to force one-at-a-time execution
+        sequential_lock = self._batch_manager.get_sequential_lock()
+        execution_slot = None
+
+        if sequential_lock and is_compensatable:
+            # Acquire execution slot (blocks until available)
+            execution_slot = sequential_lock.acquire_execution_slot(tool_call_id)
+            slot = execution_slot.__enter__()
+
+            # Check abort AFTER acquiring lock - this is the key fix!
+            if slot.should_abort:
+                execution_slot.__exit__(None, None, None)
+                logging.info(f"Tool '{tool_name}' aborted by sequential lock: {slot.abort_reason}")
+                return ToolMessage(
+                    content=f"Execution aborted: {slot.abort_reason}",
+                    tool_call_id=tool_call_id,
+                    name=tool_name,
+                    status="error",
+                )
+
+        # === BATCH ABORT GATE (fallback for non-sequential mode) ===
         batch_ctx = None
         batch_id = None
 
-        if self.enable_batch_abort and is_compensatable:
+        if self.enable_batch_abort and is_compensatable and not sequential_lock:
             # Detect batch via thread pattern
             batch_id = self._batch_manager.detect_batch(
                 tool_name, current_thread_id, tool_call_id
             )
 
             if batch_id:
-                # Get or create batch context
-                # Estimate tool count from recent calls (will be refined as more calls arrive)
                 batch_ctx = self._batch_manager.get_or_create_context(
                     batch_id=batch_id,
-                    tool_count=5,  # Initial estimate, adjusted dynamically
+                    tool_count=5,
                     tool_call_ids=[tool_call_id],
                 )
 
-                # Update intent DAG if tracking
                 if self.track_intent:
                     intent_dag = self._batch_manager.get_intent_dag(batch_id)
                     if intent_dag:
                         intent_dag.mark_executing(tool_call_id)
 
-                # CHECK ABORT FLAG - fail fast if another tool in batch already failed
                 if batch_ctx.should_abort():
                     logging.info(
                         f"Tool '{tool_name}' aborted: batch {batch_id} failed "
                         f"(trigger: {batch_ctx.failed_tool})"
                     )
-
-                    # Update intent DAG
                     if self.track_intent:
                         intent_dag = self._batch_manager.get_intent_dag(batch_id)
                         if intent_dag:
                             intent_dag.mark_aborted(tool_call_id)
-
                     return ToolMessage(
                         content=f"Execution aborted: {batch_ctx.abort_reason}",
                         tool_call_id=tool_call_id,
@@ -725,8 +747,8 @@ class CompensationMiddleware(AgentMiddleware):
                 timestamp=time.time(),
                 compensation_tool=self.compensation_mapping[tool_name],
                 depends_on=self._infer_dependencies(request.tool_call.get("args", {}), comp_log),
-                agent_id=self.agent_id,  # Track which agent performed this action
-                thread_id=current_thread_id,  # Track execution thread for parallel ops
+                agent_id=self.agent_id,
+                thread_id=current_thread_id,
             )
             comp_log.add(record)
             self._sync_comp_log(comp_log, state)
@@ -735,8 +757,10 @@ class CompensationMiddleware(AgentMiddleware):
         try:
             result = handler(request)
         except Exception as e:
-            # Signal batch abort on exception
-            if batch_ctx:
+            # Signal abort on exception
+            if sequential_lock:
+                sequential_lock.signal_abort(tool_name, str(e))
+            elif batch_ctx:
                 batch_ctx.signal_abort(tool_name, tool_call_id, str(e))
 
             result = ToolMessage(
@@ -758,8 +782,10 @@ class CompensationMiddleware(AgentMiddleware):
 
         # Handle error: rollback all completed actions
         if is_error:
-            # Signal batch abort so other parallel tools can fail fast
-            if batch_ctx:
+            # Signal abort so other parallel tools can fail fast
+            if sequential_lock:
+                sequential_lock.signal_abort(tool_name, str(result.content)[:200])
+            elif batch_ctx:
                 batch_ctx.signal_abort(tool_name, tool_call_id, str(result.content)[:200])
 
             # Update intent DAG
@@ -767,7 +793,7 @@ class CompensationMiddleware(AgentMiddleware):
                 intent_dag = self._batch_manager.get_intent_dag(batch_id)
                 if intent_dag:
                     intent_dag.mark_failed(tool_call_id)
-                    intent_dag.abort_pending()  # Mark pending tools as aborted
+                    intent_dag.abort_pending()
 
             logging.error(f"Tool '{tool_name}' failed. Initiating rollback...")
             comp_log = self._get_comp_log(state)
@@ -785,6 +811,9 @@ class CompensationMiddleware(AgentMiddleware):
                     error_msg = f"Compensation failed for '{record['tool_name']}' using '{comp_tool}'. "
                     error_msg += f"Result: {comp_result.content}. System in inconsistent state."
                     logging.critical(error_msg)
+                    # Release lock before raising
+                    if execution_slot:
+                        execution_slot.__exit__(None, None, None)
                     raise SagaCriticalFailure(error_msg)
 
                 comp_log.mark_compensated(record["id"])
@@ -802,14 +831,16 @@ class CompensationMiddleware(AgentMiddleware):
             comp_log.update(action_id, status="COMPLETED", result=self._extract_result(result))
             self._sync_comp_log(comp_log, state)
 
-        # Record batch execution for tracking
+        # Record batch execution for tracking (non-sequential mode)
         if batch_ctx:
-            executed_count = batch_ctx.record_execution(tool_call_id)
-
-            # Log batch report when complete (optional cleanup could be added here)
+            batch_ctx.record_execution(tool_call_id)
             if batch_ctx.is_complete():
                 report = self._batch_manager.cleanup_batch(batch_id)
                 if report:
                     logging.debug(f"Batch {batch_id} complete: {report}")
+
+        # Release sequential execution lock
+        if execution_slot:
+            execution_slot.__exit__(None, None, None)
 
         return result

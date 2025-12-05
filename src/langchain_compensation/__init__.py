@@ -85,6 +85,7 @@ from .batch import (
     IntentDAG,
     BatchDetector,
     BatchManager,
+    SequentialExecutionLock,
 )
 
 __version__ = "0.5.0"
@@ -122,4 +123,5 @@ __all__ = [
     "IntentDAG",
     "BatchDetector",
     "BatchManager",
+    "SequentialExecutionLock",
 ]

@@ -416,40 +416,157 @@ class BatchDetector:
                     del self._recent_calls[tool_name]
 
 
+class SequentialExecutionLock:
+    """Forces sequential execution of compensatable tools.
+
+    When parallel tool calls arrive simultaneously, this lock ensures
+    only one executes at a time. After each execution, the abort flag
+    is checked before allowing the next tool to proceed.
+
+    This solves the race condition where all parallel tools pass the
+    abort check before any one fails.
+
+    Example:
+        lock = SequentialExecutionLock()
+
+        # In wrap_tool_call (from different threads)
+        with lock.acquire_execution_slot(tool_call_id) as slot:
+            if slot.should_abort:
+                return "Aborted by previous failure"
+
+            result = execute_tool()
+
+            if is_error(result):
+                slot.signal_abort("Tool failed")
+    """
+
+    def __init__(self):
+        self._execution_lock = threading.Lock()
+        self._abort_flag = threading.Event()
+        self._abort_reason: str | None = None
+        self._failed_tool: str | None = None
+        self._execution_count = 0
+        self._state_lock = threading.Lock()
+
+    def should_abort(self) -> bool:
+        """Check if execution should abort."""
+        return self._abort_flag.is_set()
+
+    def signal_abort(self, tool_name: str, reason: str) -> None:
+        """Signal that subsequent tools should abort."""
+        with self._state_lock:
+            if not self._abort_flag.is_set():
+                self._abort_flag.set()
+                self._abort_reason = reason
+                self._failed_tool = tool_name
+                logging.info(f"Sequential lock: abort signaled by {tool_name}: {reason}")
+
+    def get_abort_info(self) -> tuple:
+        """Get abort information."""
+        return self._failed_tool, self._abort_reason
+
+    def reset(self) -> None:
+        """Reset the lock state for a new batch."""
+        with self._state_lock:
+            self._abort_flag.clear()
+            self._abort_reason = None
+            self._failed_tool = None
+            self._execution_count = 0
+
+    class ExecutionSlot:
+        """Context manager for a single tool execution slot."""
+
+        def __init__(self, lock: "SequentialExecutionLock", tool_call_id: str):
+            self._lock = lock
+            self._tool_call_id = tool_call_id
+            self.should_abort = False
+            self.abort_reason: str | None = None
+
+        def signal_abort(self, reason: str) -> None:
+            """Signal abort from within this slot."""
+            self._lock.signal_abort(self._tool_call_id, reason)
+
+    def acquire_execution_slot(self, tool_call_id: str) -> "SequentialExecutionLock.ExecutionSlot":
+        """Acquire an execution slot (blocks until available).
+
+        Args:
+            tool_call_id: ID of the tool call requesting the slot
+
+        Returns:
+            ExecutionSlot context manager
+        """
+        return _ExecutionSlotContext(self, tool_call_id)
+
+
+class _ExecutionSlotContext:
+    """Context manager for sequential execution slot."""
+
+    def __init__(self, lock: SequentialExecutionLock, tool_call_id: str):
+        self._lock = lock
+        self._tool_call_id = tool_call_id
+        self._slot: SequentialExecutionLock.ExecutionSlot | None = None
+
+    def __enter__(self) -> SequentialExecutionLock.ExecutionSlot:
+        # Acquire the execution lock (blocks if another tool is executing)
+        self._lock._execution_lock.acquire()
+
+        # Check abort flag AFTER acquiring lock
+        self._slot = SequentialExecutionLock.ExecutionSlot(self._lock, self._tool_call_id)
+        if self._lock.should_abort():
+            self._slot.should_abort = True
+            failed_tool, reason = self._lock.get_abort_info()
+            self._slot.abort_reason = f"Aborted due to {failed_tool}: {reason}"
+
+        return self._slot
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        # Release the lock so next tool can execute
+        self._lock._execution_lock.release()
+        return False
+
+
 class BatchManager:
     """Manages batch contexts and intent DAGs across parallel executions.
 
     Provides a unified interface for batch abort gate functionality,
-    coordinating BatchDetector, BatchContext, and IntentDAG.
+    coordinating BatchDetector, BatchContext, IntentDAG, and
+    SequentialExecutionLock.
 
     Example:
-        manager = BatchManager()
+        manager = BatchManager(sequential_execution=True)
 
         # In wrap_tool_call
-        batch_id = manager.detect_batch(tool_name, thread_id, tool_call_id)
-        if batch_id:
-            ctx = manager.get_or_create_context(batch_id, tool_count=5)
-            if ctx.should_abort():
+        with manager.get_execution_slot(tool_call_id) as slot:
+            if slot.should_abort:
                 return "Aborted"
 
-            # On failure
-            ctx.signal_abort(tool_name, tool_call_id, "Error")
+            result = execute_tool()
 
-        # Cleanup
-        manager.cleanup_batch(batch_id)
+            if is_error(result):
+                slot.signal_abort("Error")
     """
 
-    def __init__(self, time_window_ms: float = 50, track_intent: bool = False):
+    def __init__(
+        self,
+        time_window_ms: float = 50,
+        track_intent: bool = False,
+        sequential_execution: bool = False,
+    ):
         """Initialize batch manager.
 
         Args:
             time_window_ms: Time window for batch detection
             track_intent: Whether to track intent DAGs for observability
+            sequential_execution: If True, forces sequential execution of
+                compensatable tools. This is the most reliable way to prevent
+                parallel execution race conditions.
         """
         self._detector = BatchDetector(time_window_ms=time_window_ms)
         self._contexts: Dict[str, BatchContext] = {}
         self._intent_dags: Dict[str, IntentDAG] = {}
         self._track_intent = track_intent
+        self._sequential_execution = sequential_execution
+        self._sequential_lock = SequentialExecutionLock() if sequential_execution else None
         self._lock = threading.Lock()
 
     def detect_batch(
@@ -578,3 +695,16 @@ class BatchManager:
         """Get number of active batches being tracked."""
         with self._lock:
             return len(self._contexts)
+
+    def is_sequential_execution_enabled(self) -> bool:
+        """Check if sequential execution mode is enabled."""
+        return self._sequential_execution
+
+    def get_sequential_lock(self) -> SequentialExecutionLock | None:
+        """Get the sequential execution lock if enabled."""
+        return self._sequential_lock
+
+    def reset_sequential_lock(self) -> None:
+        """Reset the sequential lock for a new agent turn."""
+        if self._sequential_lock:
+            self._sequential_lock.reset()
