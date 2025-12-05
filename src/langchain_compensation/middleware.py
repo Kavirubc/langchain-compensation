@@ -416,6 +416,28 @@ class CompensationMiddleware(AgentMiddleware):
                 if hasattr(tool, "name"):
                     self._tools_cache[tool.name] = tool
 
+    def on_new_agent_turn(self) -> None:
+        """Signal the start of a new agent turn.
+        
+        This resets the sequential lock's abort state, allowing the LLM
+        to make fresh tool calls even after a previous failure. Call this
+        at the start of each agent invocation cycle.
+        
+        This is useful when:
+        - The LLM receives a new user message
+        - The agent is retrying after a previous failure  
+        - A new planning cycle begins
+        
+        Example:
+            middleware = CompensationMiddleware(...)
+            
+            # At start of each agent turn
+            middleware.on_new_agent_turn()
+            result = agent.invoke({"input": user_message})
+        """
+        self._batch_manager.reset_sequential_lock()
+        logging.debug("Sequential lock reset for new agent turn")
+
     def _get_error_detector(self):
         """Lazy-load error detection strategy chain."""
         if self._error_detector is None:
@@ -819,6 +841,11 @@ class CompensationMiddleware(AgentMiddleware):
                 comp_log.mark_compensated(record["id"])
 
             self._sync_comp_log(comp_log, state)
+            
+            # NOTE: Do NOT reset sequential lock here!
+            # The lock will auto-reset when ALL tools in the transaction have been
+            # processed (either executed, failed, or aborted). This ensures true
+            # SAGA semantics where remaining tools in the batch are aborted.
 
         elif is_compensatable:
             # Update intent DAG on success

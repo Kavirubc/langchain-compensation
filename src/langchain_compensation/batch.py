@@ -417,14 +417,17 @@ class BatchDetector:
 
 
 class SequentialExecutionLock:
-    """Forces sequential execution of compensatable tools.
+    """Forces sequential execution of compensatable tools with true SAGA semantics.
 
     When parallel tool calls arrive simultaneously, this lock ensures
     only one executes at a time. After each execution, the abort flag
     is checked before allowing the next tool to proceed.
 
-    This solves the race condition where all parallel tools pass the
-    abort check before any one fails.
+    This implements true SAGA pattern:
+    - If ANY tool in a transaction fails, ALL remaining tools are aborted
+    - Rollback is triggered for completed tools
+    - The lock only resets after ALL tools in the transaction have been processed
+    - The LLM can then start fresh on the next turn
 
     Example:
         lock = SequentialExecutionLock()
@@ -447,6 +450,11 @@ class SequentialExecutionLock:
         self._failed_tool: str | None = None
         self._execution_count = 0
         self._state_lock = threading.Lock()
+        
+        # Transaction tracking for true SAGA semantics
+        self._transaction_id: str | None = None
+        self._pending_count = 0  # Tools waiting or executing in current transaction
+        self._transaction_lock = threading.Lock()
 
     def should_abort(self) -> bool:
         """Check if execution should abort."""
@@ -465,13 +473,65 @@ class SequentialExecutionLock:
         """Get abort information."""
         return self._failed_tool, self._abort_reason
 
+    def enter_transaction(self, tool_call_id: str) -> str:
+        """Called when a tool enters the transaction queue.
+        
+        This must be called BEFORE acquiring the execution lock to properly
+        track all tools that are part of this transaction/batch.
+        
+        Args:
+            tool_call_id: ID of the tool call entering the transaction
+            
+        Returns:
+            The transaction ID for this batch
+        """
+        with self._transaction_lock:
+            if self._transaction_id is None:
+                import uuid
+                self._transaction_id = str(uuid.uuid4())
+                logging.debug(f"New transaction started: {self._transaction_id}")
+            self._pending_count += 1
+            logging.debug(f"Tool {tool_call_id} entered transaction {self._transaction_id}, pending: {self._pending_count}")
+            return self._transaction_id
+
+    def exit_transaction(self, tool_call_id: str) -> bool:
+        """Called when a tool exits the transaction (success, failure, or abort).
+        
+        Args:
+            tool_call_id: ID of the tool call exiting the transaction
+            
+        Returns:
+            True if this was the last tool in the transaction (transaction complete)
+        """
+        with self._transaction_lock:
+            self._pending_count -= 1
+            is_last = self._pending_count <= 0
+            logging.debug(f"Tool {tool_call_id} exited transaction {self._transaction_id}, pending: {self._pending_count}, is_last: {is_last}")
+            
+            if is_last:
+                # Transaction complete - if there was an abort, we can now reset
+                if self.should_abort():
+                    logging.info(f"Transaction {self._transaction_id} complete after abort - resetting for next turn")
+                self._transaction_id = None  # Ready for new transaction
+            
+            return is_last
+
     def reset(self) -> None:
-        """Reset the lock state for a new batch."""
+        """Reset the lock state for a new transaction.
+        
+        This clears the abort flag and transaction state. Should only be called:
+        1. Automatically when a transaction completes (all tools processed)
+        2. Explicitly via on_new_agent_turn() at agent turn boundaries
+        """
         with self._state_lock:
-            self._abort_flag.clear()
-            self._abort_reason = None
-            self._failed_tool = None
-            self._execution_count = 0
+            with self._transaction_lock:
+                self._abort_flag.clear()
+                self._abort_reason = None
+                self._failed_tool = None
+                self._execution_count = 0
+                self._transaction_id = None
+                self._pending_count = 0
+                logging.debug("Sequential lock reset")
 
     class ExecutionSlot:
         """Context manager for a single tool execution slot."""
@@ -499,14 +559,26 @@ class SequentialExecutionLock:
 
 
 class _ExecutionSlotContext:
-    """Context manager for sequential execution slot."""
+    """Context manager for sequential execution slot with transaction tracking.
+    
+    Implements true SAGA semantics by:
+    1. Tracking transaction entry BEFORE acquiring the lock
+    2. Checking abort flag AFTER acquiring the lock
+    3. Tracking transaction exit and auto-resetting when all tools are processed
+    """
 
     def __init__(self, lock: SequentialExecutionLock, tool_call_id: str):
         self._lock = lock
         self._tool_call_id = tool_call_id
         self._slot: SequentialExecutionLock.ExecutionSlot | None = None
+        self._entered_transaction = False
 
     def __enter__(self) -> SequentialExecutionLock.ExecutionSlot:
+        # Track entry BEFORE acquiring lock - this ensures we count ALL tools
+        # that are part of this transaction, even if they end up waiting
+        self._lock.enter_transaction(self._tool_call_id)
+        self._entered_transaction = True
+        
         # Acquire the execution lock (blocks if another tool is executing)
         self._lock._execution_lock.acquire()
 
@@ -522,6 +594,16 @@ class _ExecutionSlotContext:
     def __exit__(self, exc_type, exc_val, exc_tb):
         # Release the lock so next tool can execute
         self._lock._execution_lock.release()
+        
+        # Track transaction exit and check if we should auto-reset
+        if self._entered_transaction:
+            is_last = self._lock.exit_transaction(self._tool_call_id)
+            if is_last and self._lock.should_abort():
+                # All tools in this transaction have been processed (executed or aborted)
+                # Now it's safe to reset for the next agent turn
+                self._lock.reset()
+                logging.info("Transaction complete - sequential lock reset for next turn")
+        
         return False
 
 
